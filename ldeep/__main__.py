@@ -2,27 +2,28 @@
 
 import sys
 from argparse import ArgumentParser
-from base64 import b64encode
+from base64 import b64decode, b64encode
 from datetime import date, datetime, timedelta
+from itertools import chain
 from json import dump as json_dump
 from math import fabs
 from re import compile as re_compile
 from time import sleep
 from uuid import UUID
 
+from commandparse import Command
 from Cryptodome.Cipher import AES
 from Cryptodome.Hash import MD4, SHA1
 from Cryptodome.Protocol.KDF import PBKDF2
-
-from commandparse import Command
 from ldap3.core import results as coreResults
 from ldap3.core.exceptions import LDAPAttributeError, LDAPObjectClassError
 from ldap3.protocol.formatters.formatters import format_sid
 from pyasn1.error import PyAsn1UnicodeDecodeError
 
 from ldeep._version import __version__
-from ldeep.utils import Logger, error, info
+from ldeep.utils import Logger, error, get_key_for_value, info
 from ldeep.utils import resolve as utils_resolve
+from ldeep.utils.protections import checkProtections
 from ldeep.utils.sddl import parse_ntSecurityDescriptor
 from ldeep.views.activedirectory import (
     ALL,
@@ -34,14 +35,12 @@ from ldeep.views.cache_activedirectory import CacheActiveDirectoryView
 from ldeep.views.constants import (
     FILETIME_TIMESTAMP_FIELDS,
     FOREST_LEVELS,
+    GMSA_ENCRYPTION_CONSTANTS,
     LDAP_SERVER_SD_FLAGS_OID_SEC_DESC,
     USER_ACCOUNT_CONTROL,
-    GMSA_ENCRYPTION_CONSTANTS,
 )
-from ldeep.views.structures import MSDS_MANAGEDPASSWORD_BLOB
 from ldeep.views.ldap_activedirectory import LdapActiveDirectoryView
-from ldeep.utils.protections import checkProtections
-from ldeep.utils import get_key_for_value
+from ldeep.views.structures import MSDS_MANAGEDPASSWORD_BLOB
 
 
 class Ldeep(Command):
@@ -1246,7 +1245,9 @@ class Ldeep(Command):
         """
         try:
             verbose = kwargs.get("verbose", False)
-            attributes = ALL if verbose else ["member", "msDS-ShadowPrincipalSid"]
+            attributes = (
+                ALL if verbose else ["name", "member", "msDS-ShadowPrincipalSid"]
+            )
             base = ",".join(
                 [
                     "CN=Shadow Principal Configuration,CN=Services,CN=Configuration",
@@ -1265,10 +1266,18 @@ class Ldeep(Command):
                 self.display(entries, verbose)
             else:
                 for entry in entries:
-                    for user in entry.get("member", []):
-                        print(
-                            f"User {entry['member'][0]} added to Group {format_sid(entry['msDS-ShadowPrincipalSid'])}"
+                    shadow_principal_sid = entry["msDS-ShadowPrincipalSid"]
+                    if isinstance(shadow_principal_sid, str):
+                        shadow_principal_sid = b64decode(
+                            shadow_principal_sid.encode("ascii")
                         )
+
+                    print(
+                        f"Members of the shadow principal {entry['name']} (shadow principal SID: {format_sid(shadow_principal_sid)}):"
+                    )
+                    for member in entry.get("member", []):
+                        print(f"{member:>{len(member) + 4}}")
+
         except (LDAPAttributeError, LDAPObjectClassError) as e:
             error(
                 f"{e}. The domain's functional level may be too old",
@@ -1503,185 +1512,254 @@ class Ldeep(Command):
         Arguments:
             @verbose:bool
                 Results will contain full information
+            @samaccountname:bool
+                Show the sAMAccountName's of the members of `group` instead of their DN's, where possible
             @recursive:bool
                 List recursively the members of `group`
             #group:string
-                Group to list members
+                Group to list members (sAMAccountName)
         """
-        user_prefix = "[USER] "
-        group_prefix = "[GROUP] "
-
-        group = kwargs["group"]
-        verbose = kwargs.get("verbose", False)
-        recursive = kwargs.get("recursive", False)
-
-        already_printed = set()
-
-        # Recursive function in case the recursive flag is set
-        def lookup_members(dn, primary_group_id, leading_sp, already_treated: set):
-            # Check if the current group is already processed
-            if dn in already_treated:
-                return already_treated
-
-            # Mark the current group as processed
-            already_treated.add(dn)
-
-            # Query for members of the group
-            results = self.engine.query(
-                self.engine.ACCOUNTS_IN_GROUP_FILTER(primary_group_id, dn)
-            )
-
-            if results:
-                for result in results:
-                    member_dn = result["distinguishedName"]
-                    object_class = result["objectClass"]
-                    member_primary_group_id = result["objectSid"].split("-")[-1]
-
-                    if any(
-                        cls in object_class
-                        for cls in [
-                            "user",
-                            "computer",
-                            "msDS-ManagedServiceAccount",
-                            "msDS-GroupManagedServiceAccount",
-                        ]
-                    ):
-                        print(
-                            "{g:>{width}}".format(
-                                g=user_prefix + member_dn,
-                                width=leading_sp + len(user_prefix + member_dn),
-                            )
-                        )
-                    elif "group" in object_class:
-                        print(
-                            "{g:>{width}}".format(
-                                g=group_prefix + member_dn,
-                                width=leading_sp + len(group_prefix + member_dn),
-                            )
-                        )
-                        # Recurse into nested groups
-                        lookup_members(
-                            member_dn,
-                            member_primary_group_id,
-                            leading_sp + 4,
-                            already_treated,
-                        )
-
-            return already_treated
-
-        # Getting the group DN and primary ID
-        results = list(
-            self.engine.query(
-                self.engine.GROUP_DN_FILTER(group), ["distinguishedName", "objectSid"]
-            )
+        CLASS_SUFFIX_MAP = {
+            "group": "group",
+            "msDS-ManagedServiceAccount": "sMSA",
+            "msDS-GroupManagedServiceAccount": "gMSA",
+            "foreignSecurityPrincipal": "FSP",
+            "computer": "computer",
+        }
+        FSP_CONTAINER_DN = ",".join(
+            ["CN=ForeignSecurityPrincipals", self.engine.base_dn]
         )
 
-        # Checking first that the length of the results is > 0 (at least one entry)
-        if len(list(results)) != 0:
-            group_dn = results[0]["distinguishedName"]
-            primary_group_id = results[0]["objectSid"].split("-")[-1]
+        target_group = kwargs["group"]
+        verbose = kwargs.get("verbose", False)
+        prefer_samaccountname = kwargs.get("samaccountname", False)
+        recursive = kwargs.get("recursive", False)
 
-            # As there is a result, we get the users within the group
-            results = self.engine.query(
+        visited_groups = set()
+
+        def process_group(group_dn, group_sid, group_samaccountname, depth):
+            if group_dn in visited_groups:
+                return
+            visited_groups.add(group_dn)
+
+            try:
+                primary_group_id = group_sid.split("-")[-1]
+            except IndexError:
+                error(f"Invalid SID format for group {group_dn}: {group_sid}")
+                return
+
+            members = self.engine.query(
                 self.engine.ACCOUNTS_IN_GROUP_FILTER(primary_group_id, group_dn)
             )
 
-            # Iterating over each user / group belonging to the group
-            for result in results:
-                # Getting DN and ObjectClass attributes of the user / group
-                dn = result["distinguishedName"]
-                object_class = result["objectClass"]
+            # To track which members we found in the domain, to deduce externals later
+            found_member_dns = set()
 
-                if any(
-                    cls in object_class
-                    for cls in [
-                        "user",
-                        "computer",
-                        "msDS-ManagedServiceAccount",
-                        "msDS-GroupManagedServiceAccount",
-                    ]
-                ):
-                    print(user_prefix + dn)
-                elif "group" in object_class:
-                    print(group_prefix + dn)
-                    if recursive:
-                        primary_group_id = result["objectSid"].split("-")[-1]
-                        s = lookup_members(dn, primary_group_id, 4, already_printed)
-                        already_printed.union(s)
+            for member in members:
+                dn = member.get("distinguishedName")
+                if not dn:
+                    continue
 
-            self.display(results, verbose)
+                found_member_dns.add(dn)
+                samaccountname = member.get("sAMAccountName", dn)
+                object_class = member.get("objectClass", [])
 
-        # If the list's length == 0 it means no entry were found and therefore the group does not exist
-        else:
-            error("Group '{group}' does not exist".format(group=group))
+                suffix = next(
+                    (
+                        mapped
+                        for cl, mapped in CLASS_SUFFIX_MAP.items()
+                        if cl in object_class
+                    ),
+                    "user",
+                )
+
+                if verbose:
+                    yield member
+                else:
+                    display_name = dn
+                    if prefer_samaccountname:
+                        display_name = samaccountname
+
+                    print(
+                        "{p:>{width}}".format(
+                            p=display_name + " (" + suffix + ")",
+                            width=depth + len(display_name + " (" + suffix + ")"),
+                        )
+                    )
+
+                if recursive and "group" in object_class:
+                    sid = member.get("objectSid")
+                    if sid:
+                        yield from process_group(dn, sid, samaccountname, depth + 4)
+
+            # Check for members (trusted principals) not found in previous query
+            # We fetch the 'member' attribute of the group itself.
+            # Any DN in 'member' that wasn't in the previous query result is likely trusted.
+            group_obj_result = list(
+                self.engine.query(
+                    self.engine.GROUP_DN_FILTER(group_samaccountname),
+                    ["member"],
+                )
+            )
+
+            if not group_obj_result or "member" not in group_obj_result[0]:
+                return
+
+            for direct_member_dn in group_obj_result[0]["member"]:
+                if direct_member_dn in found_member_dns:
+                    continue
+
+                if verbose:
+                    yield {
+                        "dn": direct_member_dn,
+                        "distinguishedName": direct_member_dn,
+                    }
+                else:
+                    suffix = "trusted"
+                    if direct_member_dn.endswith(FSP_CONTAINER_DN):
+                        suffix = CLASS_SUFFIX_MAP["foreignSecurityPrincipal"]
+
+                    print(
+                        "{p:>{width}}".format(
+                            p=direct_member_dn + " (" + suffix + ")",
+                            width=depth + len(direct_member_dn + " (" + suffix + ")"),
+                        )
+                    )
+
+        # Entry point
+        results = list(
+            self.engine.query(
+                self.engine.GROUP_DN_FILTER(target_group),
+                ["distinguishedName", "objectSid"],
+            )
+        )
+
+        if not results:
+            error(f"Group '{target_group}' does not exist")
+            return
+
+        root_dn = results[0]["distinguishedName"]
+        root_sid = results[0]["objectSid"]
+
+        members = process_group(root_dn, root_sid, target_group, 0)
+        self.display(members, verbose)
 
     def get_memberships(self, kwargs):
         """
-        List the group for which `account` belongs to.
+        List the groups to which `object` belongs.
 
         Arguments:
-            #account:string
-                User to list memberships
+            @verbose:bool
+                Results will contain full information
+            @samaccountname:bool
+                Show the sAMAccountName's of the groups to which `object` belongs instead of their DN's, where possible
             @recursive:bool
                 List recursively the groups
+            #account:string
+                Object to list memberships (sAMAccountName)
         """
-        account = kwargs["account"]
+        SHADOW_PRINCIPAL_CONTAINER_DN = ",".join(
+            [
+                "CN=Shadow Principal Configuration,CN=Services,CN=Configuration",
+                self.engine.base_dn,
+            ]
+        )
+
+        target_account = kwargs["account"]
+        verbose = kwargs.get("verbose", False)
+        prefer_samaccountname = kwargs.get("samaccountname", False)
         recursive = kwargs.get("recursive", False)
 
-        already_printed = set()
+        visited_groups = set()
 
-        def lookup_groups(dn, leading_sp, already_treated):
-            results = self.engine.query(
-                self.engine.DISTINGUISHED_NAME(dn), ["memberOf", "primaryGroupID"]
+        def process_group(group_dn, depth):
+            visited_groups.add(group_dn)
+
+            results = list(
+                self.engine.query(
+                    self.engine.DISTINGUISHED_NAME(group_dn),
+                )
             )
-            for result in results:
-                if "memberOf" in result:
-                    for group_dn in result["memberOf"]:
-                        if group_dn not in already_treated:
-                            print(
-                                "{g:>{width}}".format(
-                                    g=group_dn, width=leading_sp + len(group_dn)
-                                )
-                            )
-                            already_treated.add(group_dn)
-                            lookup_groups(group_dn, leading_sp + 4, already_treated)
 
-                if "primaryGroupID" in result and result["primaryGroupID"]:
-                    pid = result["primaryGroupID"]
-                    results = list(self.engine.query(self.engine.PRIMARY_GROUP_ID(pid)))
-                    if results:
-                        already_treated.add(results[0]["dn"])
+            # Particular case: the object may be a member of a shadow principal instead of a group
+            if not results:
+                results = list(
+                    self.engine.query(
+                        self.engine.DISTINGUISHED_NAME(group_dn),
+                        base=SHADOW_PRINCIPAL_CONTAINER_DN,
+                    )
+                )
 
-            return already_treated
+            if not results:
+                return
 
-        results = self.engine.query(
-            self.engine.ACCOUNT_IN_GROUPS_FILTER(account),
-            ["memberOf", "primaryGroupID"],
+            group_obj = results[0]
+
+            if verbose:
+                yield group_obj
+            else:
+                display_name = group_dn
+                if prefer_samaccountname:
+                    display_name = group_obj.get("sAMAccountName", display_name)
+
+                suffix = "group"
+                if display_name.endswith(SHADOW_PRINCIPAL_CONTAINER_DN):
+                    suffix = "shadow principal"
+
+                print(
+                    "{p:>{width}}".format(
+                        p=str(display_name + " (" + suffix + ")"),
+                        width=depth + len(str(display_name + " (" + suffix + ")")),
+                    )
+                )
+
+            if recursive and "memberOf" in group_obj:
+                for parent_dn in group_obj["memberOf"]:
+                    if parent_dn in visited_groups:
+                        return
+                    yield from process_group(parent_dn, depth + 4)
+
+        # Entry point
+        attributes = ["memberOf", "primaryGroupID"]
+        results = list(
+            self.engine.query(
+                self.engine.ACCOUNT_IN_GROUPS_FILTER(target_account),
+                attributes,
+            )
         )
-        for result in results:
-            if "memberOf" in result:
-                for group_dn in result["memberOf"]:
-                    print(group_dn)
-                    if recursive:
-                        already_printed.add(group_dn)
-                        s = lookup_groups(group_dn, 4, already_printed)
-                        already_printed.union(s)
 
-            # for some reason, when we request an attribute which is not set on an object,
-            # ldap3 returns an empty list as the value of this attribute
-            if "primaryGroupID" in result and result["primaryGroupID"] != []:
-                pid = result["primaryGroupID"]
-                results = list(self.engine.query(self.engine.PRIMARY_GROUP_ID(pid)))
-                if results:
-                    dn = results[0]["dn"]
-                    print(dn)
-                    if recursive:
-                        already_printed.add(dn)
-                        s = lookup_groups(dn, 4, already_printed)
-                        already_printed.union(s)
+        if not results:
+            error(f"Account '{target_account}' does not exist")
+            return
 
-        if len(list(results)) == 0:
-            error("User {account} does not exists".format(account=account))
+        target_obj = results[0]
+
+        # Handle Primary Group, which is not listed in 'memberOf' but calculated via primaryGroupID
+        groups_from_primary_group = []
+        # For some reason, when we request an attribute which is not set on an object,
+        # ldap3 returns an empty list as the value of this attribute
+        if "primaryGroupID" in target_obj and target_obj["primaryGroupID"]:
+            try:
+                pgid = target_obj["primaryGroupID"]
+                pg_res = list(self.engine.query(self.engine.PRIMARY_GROUP_ID(pgid)))
+                if pg_res:
+                    pg_dn = pg_res[0].get("distinguishedName")
+                    if pg_dn:
+                        groups_from_primary_group = process_group(pg_dn, 0)
+            except Exception as e:
+                error(f"Failed to resolve Primary Group: {e}")
+
+        # Handle direct 'memberOf' groups
+        groups_from_memberof = []
+        if "memberOf" in target_obj and target_obj["memberOf"]:
+            groups = target_obj["memberOf"]
+            for group_dn in groups:
+                groups_from_memberof.append(process_group(group_dn, 0))
+
+        flat_groups_from_memberof = chain.from_iterable(groups_from_memberof)
+        self.display(
+            chain(groups_from_primary_group, flat_groups_from_memberof), verbose
+        )
 
     def get_from_sid(self, kwargs):
         """
