@@ -204,7 +204,7 @@ class LdapActiveDirectoryView(ActiveDirectoryView):
     )
     GROUPS_FILTER = lambda _: "(objectClass=group)"
     ZONES_FILTER = lambda _: "(&(objectClass=dnsZone)(!(dc=RootDNSServers)))"
-    ZONE_FILTER = lambda _: "(objectClass=dnsNode)"
+    DNS_FILTER = lambda _: "(objectClass=dnsNode)"
     SITES_FILTER = lambda _: "(objectClass=site)"
     SUBNET_FILTER = lambda _, s: f"(SiteObject={s})"
     PKI_FILTER = lambda _: "(objectClass=pKIEnrollmentService)"
