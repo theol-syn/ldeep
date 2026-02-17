@@ -11,6 +11,7 @@ from ldeep.views.activedirectory import (
 from ldeep.views.constants import WELL_KNOWN_SIDS
 from ldeep.utils import error
 
+warned_missing_files = set()
 FILE_CONTENT_DICT = dict()
 
 
@@ -317,7 +318,9 @@ class CacheActiveDirectoryView(ActiveDirectoryView):
 
             replacement = cachefilter.get("replacement", None)
             if not path.exists(filename) and replacement is None:
-                error(f"{filename} required but not found")
+                if filename not in warned_missing_files:
+                    error(f"{filename} required but not found")
+                    warned_missing_files.add(filename)
                 continue
             if not path.exists(filename) and replacement:
                 cachefilter["files"] = cachefilter["replacement"]["files"]
