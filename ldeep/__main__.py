@@ -1670,9 +1670,10 @@ class Ldeep(Command):
         prefer_dn = kwargs.get("dn", False)
         recursive = kwargs.get("recursive", False)
 
-        visited_groups = set()
-
-        def process_group(group_dn, depth):
+        def process_group(group_dn, depth, stop_recursion=False):
+            if group_dn in visited_groups:
+                # We do not return directly, we want to display the group first
+                stop_recursion = True
             visited_groups.add(group_dn)
 
             results = list(
@@ -1713,14 +1714,14 @@ class Ldeep(Command):
                     )
                 )
 
-            if recursive and "memberOf" in group_obj:
-                for parent_dn in group_obj["memberOf"]:
-                    if parent_dn in visited_groups:
-                        return
-                    yield from process_group(parent_dn, depth + 4)
+            if not recursive or stop_recursion or "memberOf" not in group_obj:
+                return
+
+            for parent_dn in group_obj["memberOf"]:
+                yield from process_group(parent_dn, depth + 4)
 
         # Entry point
-        attributes = ["memberOf", "primaryGroupID"]
+        attributes = ["memberOf", "primaryGroupID", "distinguishedName"]
         results = list(
             self.engine.query(
                 self.engine.ACCOUNT_IN_GROUPS_FILTER(target_account),
@@ -1733,6 +1734,7 @@ class Ldeep(Command):
             return
 
         target_obj = results[0]
+        visited_groups = {target_obj["distinguishedName"]}
 
         # Handle Primary Group, which is not listed in 'memberOf' but calculated via primaryGroupID
         groups_from_primary_group = []
