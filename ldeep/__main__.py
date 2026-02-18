@@ -17,7 +17,6 @@ from Cryptodome.Hash import MD4, SHA1
 from Cryptodome.Protocol.KDF import PBKDF2
 from ldap3.core import results as coreResults
 from ldap3.core.exceptions import LDAPAttributeError, LDAPObjectClassError
-from ldap3.protocol.formatters.formatters import format_sid
 from pyasn1.error import PyAsn1UnicodeDecodeError
 
 from ldeep._version import __version__
@@ -1266,14 +1265,11 @@ class Ldeep(Command):
                 self.display(entries, verbose)
             else:
                 for entry in entries:
-                    shadow_principal_sid = entry["msDS-ShadowPrincipalSid"]
-                    if isinstance(shadow_principal_sid, str):
-                        shadow_principal_sid = b64decode(
-                            shadow_principal_sid.encode("ascii")
-                        )
-
                     print(
-                        f"Members of the shadow principal {entry['name']} (shadow principal SID: {format_sid(shadow_principal_sid)}):"
+                        (
+                            f"Members of the shadow principal {entry['name']} "
+                            f"(shadow principal SID: {entry['msDS-ShadowPrincipalSid']}):"
+                        )
                     )
                     for member in entry.get("member", []):
                         print(f"{member:>{len(member) + 4}}")
@@ -1580,12 +1576,8 @@ class Ldeep(Command):
                     if prefer_dn:
                         display_name = dn
 
-                    print(
-                        "{p:>{width}}".format(
-                            p=display_name + " (" + suffix + ")",
-                            width=depth + len(display_name + " (" + suffix + ")"),
-                        )
-                    )
+                    label = f"{display_name} ({suffix})"
+                    print(f"{label:>{depth + len(label)}}")
 
                 if recursive and "group" in object_class:
                     sid = member.get("objectSid")
@@ -1619,12 +1611,8 @@ class Ldeep(Command):
                     if direct_member_dn.endswith(FSP_CONTAINER_DN):
                         suffix = CLASS_SUFFIX_MAP["foreignSecurityPrincipal"]
 
-                    print(
-                        "{p:>{width}}".format(
-                            p=direct_member_dn + " (" + suffix + ")",
-                            width=depth + len(direct_member_dn + " (" + suffix + ")"),
-                        )
-                    )
+                    label = f"{direct_member_dn} ({suffix})"
+                    print(f"{label:>{depth + len(label)}}")
 
         # Entry point
         results = list(
@@ -1707,12 +1695,8 @@ class Ldeep(Command):
                 if display_name.endswith(SHADOW_PRINCIPAL_CONTAINER_DN):
                     suffix = "shadow principal"
 
-                print(
-                    "{p:>{width}}".format(
-                        p=str(display_name + " (" + suffix + ")"),
-                        width=depth + len(str(display_name + " (" + suffix + ")")),
-                    )
-                )
+                label = f"{display_name} ({suffix})"
+                print(f"{label:>{depth + len(label)}}")
 
             if not recursive or stop_recursion or "memberOf" not in group_obj:
                 return

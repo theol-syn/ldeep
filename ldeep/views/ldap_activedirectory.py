@@ -37,7 +37,7 @@ from ldap3.extend.microsoft.removeMembersFromGroups import (
     ad_remove_members_from_groups as removeUsersInGroups,
 )
 from ldap3.extend.microsoft.unlockAccount import ad_unlock_account
-from ldap3.protocol.formatters.formatters import format_sid, format_ad_timestamp
+from ldap3.protocol.formatters.formatters import format_ad_timestamp, format_sid
 
 from ldeep.utils.sddl import parse_ntSecurityDescriptor
 from ldeep.views.activedirectory import (
@@ -49,13 +49,13 @@ from ldeep.views.activedirectory import (
 from ldeep.views.constants import (
     DNS_TYPES,
     GROUP_TYPE,
+    KERBEROS_ENC_TYPE,
     LOGON_SAM_LOGON_RESPONSE_EX,
     PWD_PROPERTIES,
     SAM_ACCOUNT_TYPE,
     TRUSTS_INFOS,
     USER_ACCOUNT_CONTROL,
     WELL_KNOWN_SIDS,
-    KERBEROS_ENC_TYPE,
 )
 
 
@@ -189,6 +189,11 @@ ldap3.protocol.formatters.standard.standard_formatter["1.2.840.113556.1.4.750"] 
 # msDS-SupportedEncryptionTypes
 ldap3.protocol.formatters.standard.standard_formatter["1.2.840.113556.1.4.1963"] = (
     lambda val: format_bitmask(val, KERBEROS_ENC_TYPE, 8),
+    None,
+)
+# msDS-ShadowPrincipalSid
+ldap3.protocol.formatters.standard.standard_formatter["1.2.840.113556.1.4.2324"] = (
+    format_sid,
     None,
 )
 
