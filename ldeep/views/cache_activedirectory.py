@@ -1,6 +1,7 @@
 from json import load as json_load
 from os import path
 
+from ldeep.utils import error
 from ldeep.views.activedirectory import (
     ALL,
     ALL_ATTRIBUTES,
@@ -9,7 +10,6 @@ from ldeep.views.activedirectory import (
     validate_sid,
 )
 from ldeep.views.constants import WELL_KNOWN_SIDS
-from ldeep.utils import error
 
 warned_missing_files = set()
 FILE_CONTENT_DICT = dict()
@@ -96,7 +96,7 @@ class CacheActiveDirectoryView(ActiveDirectoryView):
     }
     DISTINGUISHED_NAME = lambda _, n: {
         "fmt": "json",
-        "files": ["users_all", "groups", "machines"],
+        "files": ["users_all", "groups", "machines", "shadow_principals"],
         "filter": lambda x: eq(x["distinguishedName"], n),
     }
     PRIMARY_GROUP_ID = lambda _, i: {
